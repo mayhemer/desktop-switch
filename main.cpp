@@ -11,10 +11,12 @@
 typedef int (__cdecl *GoToDesktopNumberProc)(int desktopNumber);
 typedef int (__cdecl *GetDesktopCountProc)();
 typedef int (__cdecl *GetCurrentDesktopNumberProc)();
+typedef int (__cdecl *MoveWindowToDesktopNumberProc)(HWND hwnd, int desktopNumber);
 
 static GoToDesktopNumberProc GoToDesktopNumber = nullptr;
 static GetDesktopCountProc GetDesktopCount = nullptr;
 static GetCurrentDesktopNumberProc GetCurrentDesktopNumber = nullptr;
+static MoveWindowToDesktopNumberProc MoveWindowToDesktopNumber = nullptr;
 
 // --- Globals ---
 
@@ -23,6 +25,7 @@ static HMENU g_hMenu = nullptr;
 static const UINT WM_TRAYICON = WM_USER + 1;
 static const UINT HOTKEY_BASE = 1000;
 static const UINT HOTKEY_LAST = 1100;
+static const UINT HOTKEY_MOVE_BASE = 1200;
 static int g_lastDesktop = -1;
 
 // --- DLL Loading ---
@@ -48,6 +51,7 @@ static HMODULE LoadVDA() {
     GoToDesktopNumber = (GoToDesktopNumberProc)GetProcAddress(hDll, "GoToDesktopNumber");
     GetDesktopCount = (GetDesktopCountProc)GetProcAddress(hDll, "GetDesktopCount");
     GetCurrentDesktopNumber = (GetCurrentDesktopNumberProc)GetProcAddress(hDll, "GetCurrentDesktopNumber");
+    MoveWindowToDesktopNumber = (MoveWindowToDesktopNumberProc)GetProcAddress(hDll, "MoveWindowToDesktopNumber");
 
     if (!GoToDesktopNumber) {
         MessageBoxW(nullptr,
@@ -75,12 +79,34 @@ static void SwitchToDesktop(int index) {
     if (GetDesktopCount && index >= GetDesktopCount()) return;
 
     if (current >= 0) g_lastDesktop = current;
+
+    // This allows restoring the last active window on this desktop automatically
+    // Without `AllowSetForegroundWindow` the window on the last desktop stays active
+    // and accepts input.  This also removes the task bar application icons blinking.
+    AllowSetForegroundWindow(ASFW_ANY);
     GoToDesktopNumber(index);
 }
 
 static void SwitchToLastDesktop() {
     if (g_lastDesktop < 0) return;
     SwitchToDesktop(g_lastDesktop);
+}
+
+static void MoveActiveWindowToDesktop(int index) {
+    if (!MoveWindowToDesktopNumber || !GoToDesktopNumber) return;
+
+    int current = GetCurrentDesktopNumber ? GetCurrentDesktopNumber() : -1;
+    if (current == index) return;
+    if (GetDesktopCount && index >= GetDesktopCount()) return;
+
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) return;
+
+    if (MoveWindowToDesktopNumber(hwnd, index) < 0) return;
+
+    if (current >= 0) g_lastDesktop = current;
+    GoToDesktopNumber(index);
+    SetForegroundWindow(hwnd);
 }
 
 // --- Icon ---
@@ -141,7 +167,7 @@ static void CreateTrayIcon(HWND hwnd) {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = CreateDesktopSwitchIcon();
-    wcscpy_s(g_nid.szTip, L"Desktop Switch (Alt+1..9)");
+    wcscpy_s(g_nid.szTip, L"Desktop Switch (Alt+1..9, Ctrl+Alt+1..9)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
@@ -158,6 +184,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SwitchToDesktop((int)(wParam - HOTKEY_BASE));
         } else if (wParam == HOTKEY_LAST) {
             SwitchToLastDesktop();
+        } else if (wParam >= HOTKEY_MOVE_BASE && wParam < HOTKEY_MOVE_BASE + 9) {
+            MoveActiveWindowToDesktop((int)(wParam - HOTKEY_MOVE_BASE));
         }
         return 0;
 
@@ -215,6 +243,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         registered++;
     }
 
+    // Ctrl+Alt+1..9 to move active window to desktop and follow
+    if (MoveWindowToDesktopNumber) {
+        for (int i = 0; i < 9; i++) {
+            if (RegisterHotKey(hwnd, HOTKEY_MOVE_BASE + i, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, '1' + i)) {
+                registered++;
+            }
+        }
+    }
+
     if (registered == 0) {
         MessageBoxW(nullptr,
             L"Failed to register any hotkeys.\n"
@@ -238,6 +275,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         UnregisterHotKey(hwnd, HOTKEY_BASE + i);
     }
     UnregisterHotKey(hwnd, HOTKEY_LAST);
+    for (int i = 0; i < 9; i++) {
+        UnregisterHotKey(hwnd, HOTKEY_MOVE_BASE + i);
+    }
     RemoveTrayIcon();
     DestroyMenu(g_hMenu);
     FreeLibrary(hVDA);

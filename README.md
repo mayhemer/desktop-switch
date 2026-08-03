@@ -1,10 +1,12 @@
 # Desktop Switch
 
-A minimal Windows 11 tray icon application that switches virtual desktops via Alt+1 through Alt+9.
+A minimal Windows 11 tray icon application that switches virtual desktops via global hotkeys, moves windows between desktops, and properly restores focus on the target desktop.
 
 ## How it works
 
-Registers global hotkeys Alt+1..Alt+9. On keypress, calls `GoToDesktopNumber()` from [VirtualDesktopAccessor.dll](https://github.com/Ciantic/VirtualDesktopAccessor) to instantly jump to the target desktop by index. A system tray icon is shown; right-click it to exit.
+Registers global hotkeys for desktop switching and window moving. Delegates virtual desktop operations to [VirtualDesktopAccessor.dll](https://github.com/Ciantic/VirtualDesktopAccessor) which wraps undocumented Windows 11 `IVirtualDesktopManagerInternal` COM interfaces.
+
+Before switching desktops, the app calls `AllowSetForegroundWindow(ASFW_ANY)` to relinquish its foreground activation rights. This allows the OS to restore focus to the previously active window on the target desktop — the same behavior as the native Ctrl+Win+Arrow shortcuts.
 
 ## Prerequisites
 
@@ -36,11 +38,9 @@ Run `DesktopSwitch.exe`. It sits in the system tray and responds to:
 
 | Hotkey | Action |
 |--------|--------|
-| Alt+1  | Switch to desktop 1 |
-| Alt+2  | Switch to desktop 2 |
-| ...    | ... |
-| Alt+9  | Switch to desktop 9 |
-| Alt+`  | Switch to most recent desktop |
+| Alt+1..9 | Switch to desktop N |
+| Alt+` | Switch to most recent desktop |
+| Ctrl+Alt+1..9 | Move the active window to desktop N and follow |
 
 Right-click the tray icon to exit.
 
@@ -49,3 +49,4 @@ Right-click the tray icon to exit.
 - Only one instance can run at a time.
 - If a hotkey fails to register (another app is using it), a warning is shown at startup.
 - The target desktop must already exist — the app does not create new desktops.
+- Ctrl+Alt hotkeys are only registered if the DLL exports `MoveWindowToDesktopNumber`.
