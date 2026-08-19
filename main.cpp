@@ -26,6 +26,7 @@ static const UINT WM_TRAYICON = WM_USER + 1;
 static const UINT HOTKEY_BASE = 1000;
 static const UINT HOTKEY_LAST = 1100;
 static const UINT HOTKEY_MOVE_BASE = 1200;
+static const UINT HOTKEY_SEND_BASE = 1300;
 static int g_lastDesktop = -1;
 
 // --- DLL Loading ---
@@ -92,8 +93,9 @@ static void SwitchToLastDesktop() {
     SwitchToDesktop(g_lastDesktop);
 }
 
-static void MoveActiveWindowToDesktop(int index) {
-    if (!MoveWindowToDesktopNumber || !GoToDesktopNumber) return;
+static void MoveActiveWindowToDesktop(int index, bool follow) {
+    if (!MoveWindowToDesktopNumber) return;
+    if (follow && !GoToDesktopNumber) return;
 
     int current = GetCurrentDesktopNumber ? GetCurrentDesktopNumber() : -1;
     if (current == index) return;
@@ -105,8 +107,11 @@ static void MoveActiveWindowToDesktop(int index) {
     if (MoveWindowToDesktopNumber(hwnd, index) < 0) return;
 
     if (current >= 0) g_lastDesktop = current;
-    GoToDesktopNumber(index);
-    SetForegroundWindow(hwnd);
+
+    if (follow) {
+        GoToDesktopNumber(index);
+        SetForegroundWindow(hwnd);
+    }
 }
 
 // --- Icon ---
@@ -167,7 +172,7 @@ static void CreateTrayIcon(HWND hwnd) {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = CreateDesktopSwitchIcon();
-    wcscpy_s(g_nid.szTip, L"Desktop Switch (Alt+1..9, Ctrl+Alt+1..9)");
+    wcscpy_s(g_nid.szTip, L"Desktop Switch (Alt, Ctrl+Alt, Shift+Ctrl+Alt)+1..9");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
@@ -185,7 +190,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         } else if (wParam == HOTKEY_LAST) {
             SwitchToLastDesktop();
         } else if (wParam >= HOTKEY_MOVE_BASE && wParam < HOTKEY_MOVE_BASE + 9) {
-            MoveActiveWindowToDesktop((int)(wParam - HOTKEY_MOVE_BASE));
+            MoveActiveWindowToDesktop((int)(wParam - HOTKEY_MOVE_BASE), true);
+        } else if (wParam >= HOTKEY_SEND_BASE && wParam < HOTKEY_SEND_BASE + 9) {
+            MoveActiveWindowToDesktop((int)(wParam - HOTKEY_SEND_BASE), false);
         }
         return 0;
 
@@ -250,6 +257,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
                 registered++;
             }
         }
+        // Shift+Ctrl+Alt+1..9 to move active window to desktop without switching
+        for (int i = 0; i < 9; i++) {
+            if (RegisterHotKey(hwnd, HOTKEY_SEND_BASE + i, MOD_SHIFT | MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, '1' + i)) {
+                registered++;
+            }
+        }
     }
 
     if (registered == 0) {
@@ -277,6 +290,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     UnregisterHotKey(hwnd, HOTKEY_LAST);
     for (int i = 0; i < 9; i++) {
         UnregisterHotKey(hwnd, HOTKEY_MOVE_BASE + i);
+    }
+    for (int i = 0; i < 9; i++) {
+        UnregisterHotKey(hwnd, HOTKEY_SEND_BASE + i);
     }
     RemoveTrayIcon();
     DestroyMenu(g_hMenu);
