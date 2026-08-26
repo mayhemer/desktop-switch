@@ -12,21 +12,35 @@ typedef int (__cdecl *GoToDesktopNumberProc)(int desktopNumber);
 typedef int (__cdecl *GetDesktopCountProc)();
 typedef int (__cdecl *GetCurrentDesktopNumberProc)();
 typedef int (__cdecl *MoveWindowToDesktopNumberProc)(HWND hwnd, int desktopNumber);
+typedef int (__cdecl *RegisterPostMessageHookProc)(HWND hwnd, UINT message_offset);
+typedef void (__cdecl *UnregisterPostMessageHookProc)(HWND hwnd);
 
 static GoToDesktopNumberProc GoToDesktopNumber = nullptr;
 static GetDesktopCountProc GetDesktopCount = nullptr;
 static GetCurrentDesktopNumberProc GetCurrentDesktopNumber = nullptr;
 static MoveWindowToDesktopNumberProc MoveWindowToDesktopNumber = nullptr;
+static RegisterPostMessageHookProc RegisterPostMessageHook = nullptr;
+static UnregisterPostMessageHookProc UnregisterPostMessageHook = nullptr;
 
 // --- Globals ---
 
 static NOTIFYICONDATAW g_nid = {};
 static HMENU g_hMenu = nullptr;
 static const UINT WM_TRAYICON = WM_USER + 1;
+static const UINT WM_DESKTOP_CHANGED = WM_USER + 2;
 static const UINT HOTKEY_BASE = 1000;
 static const UINT HOTKEY_LAST = 1100;
 static const UINT HOTKEY_MOVE_BASE = 1200;
 static const UINT HOTKEY_SEND_BASE = 1300;
+static const UINT TIMER_VALIDATE_DESKTOP = 1;
+static const UINT DESKTOP_DWELL_DELAY_MS = 1200;
+
+// Desktop history.  g_settledDesktop is the last desktop we dwelled on long
+// enough to count as a real visit; g_lastDesktop is the one we dwelled on
+// before that.  Intermediate desktops passed through during a fast burst of
+// switches (e.g. repeated Ctrl+Win+Right) never enter the history, so Alt+`
+// always returns to the desktop the burst started from.
+static int g_settledDesktop = -1;
 static int g_lastDesktop = -1;
 
 // --- DLL Loading ---
@@ -53,6 +67,8 @@ static HMODULE LoadVDA() {
     GetDesktopCount = (GetDesktopCountProc)GetProcAddress(hDll, "GetDesktopCount");
     GetCurrentDesktopNumber = (GetCurrentDesktopNumberProc)GetProcAddress(hDll, "GetCurrentDesktopNumber");
     MoveWindowToDesktopNumber = (MoveWindowToDesktopNumberProc)GetProcAddress(hDll, "MoveWindowToDesktopNumber");
+    RegisterPostMessageHook = (RegisterPostMessageHookProc)GetProcAddress(hDll, "RegisterPostMessageHook");
+    UnregisterPostMessageHook = (UnregisterPostMessageHookProc)GetProcAddress(hDll, "UnregisterPostMessageHook");
 
     if (!GoToDesktopNumber) {
         MessageBoxW(nullptr,
@@ -68,32 +84,69 @@ static HMODULE LoadVDA() {
 
 // --- Desktop Switching ---
 
-static void SwitchToDesktop(int index) {
-    if (!GoToDesktopNumber) return;
+static void OnDesktopDwellTimer(HWND hwnd) {
+    KillTimer(hwnd, TIMER_VALIDATE_DESKTOP);
+
+    int current = GetCurrentDesktopNumber ? GetCurrentDesktopNumber() : -1;
+    if (current < 0) return;
+
+    // We stayed here long enough - this desktop becomes the settled one and the
+    // previously settled one becomes the Alt+` target.  A burst that ends where
+    // it started leaves the history untouched.
+    if (current != g_settledDesktop) {
+        g_lastDesktop = g_settledDesktop;
+        g_settledDesktop = current;
+    }
+}
+
+static void StartDesktopDwellTimer(HWND hwnd) {
+    // Restart the dwell timer.  Every switch defers the commit, so only the
+    // desktop we finally rest on is recorded.
+    KillTimer(hwnd, TIMER_VALIDATE_DESKTOP);
+    SetTimer(hwnd, TIMER_VALIDATE_DESKTOP, DESKTOP_DWELL_DELAY_MS, nullptr);
+}
+
+static bool SwitchToDesktop(HWND hwnd, int index) {
+    if (!GoToDesktopNumber) return false;
 
     int current = GetCurrentDesktopNumber ? GetCurrentDesktopNumber() : -1;
 
     // Skip if already on this desktop
-    if (current == index) return;
+    if (current == index) return false;
 
     // Skip if desktop doesn't exist
-    if (GetDesktopCount && index >= GetDesktopCount()) return;
+    if (GetDesktopCount && index >= GetDesktopCount()) return false;
 
-    if (current >= 0) g_lastDesktop = current;
+    // History is updated by the dwell timer, started from WM_DESKTOP_CHANGED,
+    // which fires for all switches (both our shortcuts and Windows shortcuts)
 
     // This allows restoring the last active window on this desktop automatically
     // Without `AllowSetForegroundWindow` the window on the last desktop stays active
     // and accepts input.  This also removes the task bar application icons blinking.
     AllowSetForegroundWindow(ASFW_ANY);
     GoToDesktopNumber(index);
+    return true;
 }
 
-static void SwitchToLastDesktop() {
-    if (g_lastDesktop < 0) return;
-    SwitchToDesktop(g_lastDesktop);
+static void SwitchToLastDesktop(HWND hwnd) {
+    int current = GetCurrentDesktopNumber ? GetCurrentDesktopNumber() : -1;
+    if (current < 0) return;
+
+    // If the current desktop hasn't settled yet we're still mid-switch, so go
+    // back to where the switching started.  Once settled, toggle to the desktop
+    // visited before it.
+    int target = (current != g_settledDesktop) ? g_settledDesktop : g_lastDesktop;
+    if (target < 0) return;
+
+    // Commit the jump immediately so a second Alt+` toggles straight back
+    // instead of waiting out the dwell timer.
+    if (SwitchToDesktop(hwnd, target)) {
+        g_lastDesktop = current;
+        g_settledDesktop = target;
+    }
 }
 
-static void MoveActiveWindowToDesktop(int index, bool follow) {
+static void MoveActiveWindowToDesktop(HWND msgHwnd, int index, bool follow) {
     if (!MoveWindowToDesktopNumber) return;
     if (follow && !GoToDesktopNumber) return;
 
@@ -106,10 +159,9 @@ static void MoveActiveWindowToDesktop(int index, bool follow) {
 
     if (MoveWindowToDesktopNumber(hwnd, index) < 0) return;
 
-    if (current >= 0) g_lastDesktop = current;
-
+    // If following, SwitchToDesktop will handle the desktop switch and validation
     if (follow) {
-        GoToDesktopNumber(index);
+        SwitchToDesktop(msgHwnd, index);
         SetForegroundWindow(hwnd);
     }
 }
@@ -186,13 +238,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_HOTKEY:
         if (wParam >= HOTKEY_BASE && wParam < HOTKEY_BASE + 9) {
-            SwitchToDesktop((int)(wParam - HOTKEY_BASE));
+            SwitchToDesktop(hwnd, (int)(wParam - HOTKEY_BASE));
         } else if (wParam == HOTKEY_LAST) {
-            SwitchToLastDesktop();
+            SwitchToLastDesktop(hwnd);
         } else if (wParam >= HOTKEY_MOVE_BASE && wParam < HOTKEY_MOVE_BASE + 9) {
-            MoveActiveWindowToDesktop((int)(wParam - HOTKEY_MOVE_BASE), true);
+            MoveActiveWindowToDesktop(hwnd, (int)(wParam - HOTKEY_MOVE_BASE), true);
         } else if (wParam >= HOTKEY_SEND_BASE && wParam < HOTKEY_SEND_BASE + 9) {
-            MoveActiveWindowToDesktop((int)(wParam - HOTKEY_SEND_BASE), false);
+            MoveActiveWindowToDesktop(hwnd, (int)(wParam - HOTKEY_SEND_BASE), false);
+        }
+        return 0;
+
+    case WM_DESKTOP_CHANGED:
+        // Any desktop change - ours or a Windows shortcut (Ctrl+Win+Left/Right)
+        // - defers the history update until we stop moving.
+        StartDesktopDwellTimer(hwnd);
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == TIMER_VALIDATE_DESKTOP) {
+            OnDesktopDwellTimer(hwnd);
         }
         return 0;
 
@@ -238,6 +302,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Desktop Switch",
                                 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInstance, nullptr);
+
+    // The desktop we start on is the initial anchor for Alt+`
+    g_settledDesktop = GetCurrentDesktopNumber ? GetCurrentDesktopNumber() : -1;
+
+    // Register for desktop change notifications from VirtualDesktopAccessor.dll
+    if (RegisterPostMessageHook) {
+        if (RegisterPostMessageHook(hwnd, WM_DESKTOP_CHANGED) < 0) {
+            MessageBoxW(nullptr,
+                L"Failed to register for desktop change notifications.\n"
+                L"Alt+` may not work correctly with Windows shortcuts.",
+                L"Desktop Switch", MB_ICONWARNING);
+        }
+    }
 
     int registered = 0;
     for (int i = 0; i < 9; i++) {
@@ -294,6 +371,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     for (int i = 0; i < 9; i++) {
         UnregisterHotKey(hwnd, HOTKEY_SEND_BASE + i);
     }
+
+    // Unregister desktop change notifications
+    if (UnregisterPostMessageHook) {
+        UnregisterPostMessageHook(hwnd);
+    }
+
+    // Kill any pending validation timer
+    KillTimer(hwnd, TIMER_VALIDATE_DESKTOP);
+
     RemoveTrayIcon();
     DestroyMenu(g_hMenu);
     FreeLibrary(hVDA);
