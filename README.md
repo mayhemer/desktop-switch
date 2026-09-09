@@ -20,6 +20,7 @@ Before switching desktops, the app calls `AllowSetForegroundWindow(ASFW_ANY)` to
 ### CMake (recommended)
 
 ```
+ .\dev-prompt.ps1
 cmake -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
 ```
@@ -29,6 +30,7 @@ Output: `build/Release/DesktopSwitch.exe` + `VirtualDesktopAccessor.dll`
 For a debug build:
 
 ```
+ .\dev-prompt.ps1
 cmake --build build --config Debug
 ```
 
@@ -39,7 +41,7 @@ Run `DesktopSwitch.exe`. It sits in the system tray and responds to:
 | Hotkey | Action |
 |--------|--------|
 | Alt+1..9 | Switch to desktop N |
-| Alt+` | Switch to most recent desktop |
+| Alt+` (hold Alt, tap ` repeatedly) | Cycle back through recently used desktops, Alt+Tab style; release Alt to commit |
 | Ctrl+Alt+1..9 | Move the active window to desktop N and follow |
 
 Right-click the tray icon to exit.
