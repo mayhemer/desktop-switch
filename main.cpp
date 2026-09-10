@@ -34,6 +34,8 @@ static const UINT HOTKEY_BASE = 1000;
 static const UINT HOTKEY_LAST = 1100;
 static const UINT HOTKEY_MOVE_BASE = 1200;
 static const UINT HOTKEY_SEND_BASE = 1300;
+static const UINT HOTKEY_MOVE_LAST = 1209;
+static const UINT HOTKEY_SEND_LAST = 1309;
 static const UINT TIMER_VALIDATE_DESKTOP = 1;
 static const UINT TIMER_ALT_RELEASE_POLL = 2;
 static const UINT DESKTOP_DWELL_DELAY_MS = 1200;
@@ -45,9 +47,9 @@ static const UINT ALT_RELEASE_POLL_MS = 50;
 // of switches (e.g. repeated Ctrl+Win+Right) never enter the stack.
 static std::vector<int> g_mruStack;
 
-// Alt+` cycling session, mirroring native Alt+Tab: holding Alt and tapping
-// ` repeatedly steps deeper into g_mruStack as a preview; releasing Alt
-// commits the previewed desktop to the front of the stack.
+// Alt+`/Ctrl+Alt+` cycling session, mirroring native Alt+Tab: holding Alt
+// and tapping ` repeatedly steps deeper into g_mruStack as a preview;
+// releasing Alt commits the previewed desktop to the front of the stack.
 static bool g_cycling = false;
 static size_t g_cyclePos = 0;
 
@@ -150,11 +152,14 @@ static bool SwitchToDesktop(HWND hwnd, int index) {
     return true;
 }
 
-// One step of an Alt+`-held cycling session: the first press starts the
-// session and previews the previous desktop; each subsequent press (while
-// Alt is still held) previews one step further back in the MRU stack.
-// Nothing is committed to the stack until Alt is released.
-static void StepAltTabCycle(HWND hwnd) {
+// One step of an Alt+`/Ctrl+Alt+`-held cycling session: the first press
+// starts the session and previews the previous desktop; each subsequent
+// press (while Alt is still held) previews one step further back in the
+// MRU stack. Nothing is committed to the stack until Alt is released.
+// When moveWindow is true (Ctrl+Alt+`), the current foreground window is
+// moved to the previewed desktop; SwitchToDesktop's AllowSetForegroundWindow
+// keeps it focused there without any extra bookkeeping.
+static void StepAltTabCycle(HWND hwnd, bool moveWindow) {
     if (!g_cycling) {
         PruneMruStack();
 
@@ -173,7 +178,12 @@ static void StepAltTabCycle(HWND hwnd) {
         g_cyclePos = (g_cyclePos + 1) % g_mruStack.size();
     }
 
-    SwitchToDesktop(hwnd, g_mruStack[g_cyclePos]);
+    int target = g_mruStack[g_cyclePos];
+    if (moveWindow && MoveWindowToDesktopNumber) {
+        HWND fg = GetForegroundWindow();
+        if (fg) MoveWindowToDesktopNumber(fg, target);
+    }
+    SwitchToDesktop(hwnd, target);
 }
 
 // Fires once Alt is no longer held: commits the previewed desktop to the
@@ -185,6 +195,20 @@ static void CommitAltTabCycle(HWND hwnd) {
     if (g_cyclePos < g_mruStack.size()) {
         PromoteToFront(g_mruStack[g_cyclePos]);
     }
+}
+
+// Resolves the "target desktop" for Shift+Ctrl+Alt+`: the desktop right
+// behind the current one in the MRU stack. Single-shot: does not start or
+// affect a cycling session.
+static int ResolveBacktickTarget() {
+    PruneMruStack();
+    int current = GetCurrentDesktopNumber ? GetCurrentDesktopNumber() : -1;
+    if (current < 0) return -1;
+    if (g_mruStack.empty() || g_mruStack.front() != current) {
+        PromoteToFront(current);
+    }
+    if (g_mruStack.size() < 2) return -1;
+    return g_mruStack[1];
 }
 
 static void MoveActiveWindowToDesktop(HWND msgHwnd, int index, bool follow) {
@@ -281,11 +305,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam >= HOTKEY_BASE && wParam < HOTKEY_BASE + 9) {
             SwitchToDesktop(hwnd, (int)(wParam - HOTKEY_BASE));
         } else if (wParam == HOTKEY_LAST) {
-            StepAltTabCycle(hwnd);
+            StepAltTabCycle(hwnd, false);
         } else if (wParam >= HOTKEY_MOVE_BASE && wParam < HOTKEY_MOVE_BASE + 9) {
             MoveActiveWindowToDesktop(hwnd, (int)(wParam - HOTKEY_MOVE_BASE), true);
         } else if (wParam >= HOTKEY_SEND_BASE && wParam < HOTKEY_SEND_BASE + 9) {
             MoveActiveWindowToDesktop(hwnd, (int)(wParam - HOTKEY_SEND_BASE), false);
+        } else if (wParam == HOTKEY_MOVE_LAST) {
+            StepAltTabCycle(hwnd, true);
+        } else if (wParam == HOTKEY_SEND_LAST) {
+            int target = ResolveBacktickTarget();
+            if (target >= 0) MoveActiveWindowToDesktop(hwnd, target, false);
         }
         return 0;
 
@@ -390,6 +419,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
                 registered++;
             }
         }
+        // Ctrl+Alt+` to cycle the MRU desktop stack, carrying the active window along
+        if (RegisterHotKey(hwnd, HOTKEY_MOVE_LAST, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_OEM_3)) {
+            registered++;
+        }
+        // Shift+Ctrl+Alt+` to move active window to the last desktop without switching
+        if (RegisterHotKey(hwnd, HOTKEY_SEND_LAST, MOD_SHIFT | MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_OEM_3)) {
+            registered++;
+        }
     }
 
     if (registered == 0) {
@@ -421,6 +458,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     for (int i = 0; i < 9; i++) {
         UnregisterHotKey(hwnd, HOTKEY_SEND_BASE + i);
     }
+    UnregisterHotKey(hwnd, HOTKEY_MOVE_LAST);
+    UnregisterHotKey(hwnd, HOTKEY_SEND_LAST);
 
     // Unregister desktop change notifications
     if (UnregisterPostMessageHook) {
